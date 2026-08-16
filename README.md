@@ -12,7 +12,7 @@ LLMs GPT Sol and Fable 5 are used in conjunction for qualatative analyses and ar
 
 ## Interpreting the results
 
-From the current evals, Qwen is roughly 4.6 level on agentic engineering tasks and high level planning. Of course, this doesnt mean Qwen is the >= 4.6 at everything but for these sepcific eval sets, its roughly on par. This is genuinely surprising and I am seriously considering running this model locally. 
+From the current evals, Qwen is roughly 4.6 level on agentic engineering tasks and high level planning. Of course, this doesnt mean Qwen is the >= 4.6 at everything but for these sepcific eval sets, its roughly on par. I found Opus is better at choosing the more correct architecture, however it usually falls short in executing and assuring all invariants. This is genuinely surprising and I am seriously considering running this model locally. It could possibly pair well with a larger smarter model writing the specs.
 
 ## Repository status
 

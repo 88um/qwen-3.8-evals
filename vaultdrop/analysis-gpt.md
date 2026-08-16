@@ -98,3 +98,177 @@ Per protocol, these splits are reported side by side. They change magnitude, not
 ## Final verdict
 
 Model 1 wins because its critical checks sit on the safe side of mutation and response boundaries: conflicts are decided before writes, reads are verified before 200, and its crash/concurrency tests actually reach the states they name. Model 2 has a genuinely sound per-hash finalize/GC protocol and better streaming scalability, but it mutates before resolving conflicts, returns bytes before verifying integrity, leaks dedup state through timing, and overstates several tests and mechanisms. Those confirmed differences dominate the numerical ranking.
+
+---
+
+## Addendum — scale-oriented v2 submission
+
+Review target: `qwen-3-8-27b-v2/` against the revised scale-aware `product.md`.
+This is a new, single-reviewer hostile pass; it has not been reconciled with the
+other reviewer and does not replace the earlier two-submission reconciliation.
+
+### Bottom line
+
+The revision made **good scale architecture choices**, and the scale probe passes
+comfortably. It did not, however, make the core safety architecture correct. Two
+confirmed defects break promises 2–4: same-length corrupt bytes are served with
+HTTP 200, and a reachable finalize/GC/SIGKILL interleaving permanently loses the
+only bytes for a committed artifact. Both contradict explicit claims-register
+rows, so the protocol's doubling rule applies.
+
+Architectural concept: **7.5/10**. Hostile execution score under GPT's literal
+CRITICAL severities: **34/100 provisional**. If both critical findings are instead
+weighted HIGH, the alternative is **59/100**. The large difference is severity,
+not disagreement about either defect.
+
+### Mechanical floor and measured scale
+
+| Check | Result |
+|---|---|
+| README-only run / `migrate` / `serve` | PASS |
+| Candidate-authored tests | **31/31 passed** in 5.2 s |
+| Dependencies | PASS: Python stdlib only |
+| Claims register | PASS: 14 rows and explicit scale/durability sections |
+| 10,000-artifact listing | PASS: 0.06 s |
+| GC over 5,000 candidates | PASS: 0.84 s |
+| Validation over 5,000 blobs | PASS: 0.37 s |
+| Four concurrent 64 MiB finalizes | PASS: 0.11 s |
+| 256 MiB round-trip service RSS | PASS: 27.2 MiB peak |
+
+The scale decisions are substantively sound: all large byte paths stream in 1 MiB
+blocks; blob paths are hash-sharded; SQLite WAL permits readers during writes;
+assembly occurs outside the short claim transaction; distinct chunks/finalizes do
+not share a global application lock; GC and validation iterate rather than loading
+the full store. This is a real improvement, not scale language pasted over a
+small-object implementation.
+
+### Confirmed finding ledger
+
+| ID | Finding | Severity / weight | Claim | Confirmation |
+|---|---|---:|---|---|
+| V2-1 | Same-length corrupted blob is served with `200`, including after validation marks it invalid | **CRITICAL x2 = -50** | #3, “No partial/corrupt reads” | Live repro below; `httpd.py:159-186`, `store.py:378-404` |
+| V2-2 | GC can quarantine a newly referenced active blob; SIGKILL then makes recovery delete its only bytes | **CRITICAL x2 = -50** | #5, #8, #9 | Step-numbered interleaving and deterministic crash-remnant repro below; `store.py:346-375`, `db.py:169-198` |
+| V2-3 | Crash-during-chunk test commonly kills after the PUT returned 200 | **LOW = -2** | test-quality finding | Exact test setup produced `thread_alive=False` and a completed 200 before its 0.12 s kill |
+| V2-4 | Crash-during-GC test kills after GC returned 200 | **LOW = -2** | test-quality finding | Exact 20 x 1 MiB setup completed GC in 0.0036 s; at the test's 0.08 s kill point the worker had returned 200 |
+| V2-5 | Validator's missing-file branch catches the wrong exception and cannot flag a missing blob | **LOW, concealment = -2** | required validator behavior omitted from register | Line trace: `core.py:97-100` converts `FileNotFoundError` to `ApiError(422)`, while `store.py:389-395` catches only `FileNotFoundError` |
+
+Strict correctness: `max(0, 100 - 50 - 50 - 2 - 2 - 2) = 0%`.
+
+#### V2-1 live repro
+
+1. Upload and finalize a 65,536-byte artifact.
+2. Modify one byte of its blob in place without changing the file length.
+3. Call `/admin/validate`: it returns `200`, `mismatched: 1` and sets
+   `validated=0`.
+4. Download the artifact: the service returns `200`, the original content length,
+   and a SHA-256 different from the artifact's declared digest.
+
+Observed result:
+
+```text
+validate_status=200 mismatched=1
+download_status=200 same_length=true digest_matches=false
+```
+
+The implementation checks only `stat().st_size` before sending the 200 headers.
+It neither hashes the file nor consults `validated`. The honest limitation saying
+downloads do not re-hash is useful disclosure, but it cannot waive promise 2 and
+directly contradicts registered claim #3.
+
+#### V2-2 confirmed interleaving
+
+Precondition: content exists as `pending`, `refcount=0`, after its final artifact
+was deleted. A new upload of the same bytes is ready to finalize.
+
+1. GC's open cursor selects the pending candidate at `store.py:346-353`.
+2. Finalize runs `_claim_recover` at `store.py:209-223,269-279`; its transaction
+   changes the blob to `active`, increments `refcount` to 1, inserts the artifact,
+   and returns 200.
+3. GC executes its conditional tombstone `UPDATE` at `store.py:355-359`. It
+   affects **zero rows**, because the blob is now active.
+4. `Database.txn` returns the SQLite cursor object, not its `rowcount`
+   (`db.py:90-97`). A cursor is truthy, so `if not changed` at `store.py:360`
+   does not stop GC.
+5. GC renames the live canonical blob to `*.gcq.*` at `store.py:362-364`.
+6. SIGKILL lands before the active-state check restores it at
+   `store.py:368-371`.
+7. On restart, recovery unconditionally deletes every quarantine file at
+   `db.py:176-180`; it neither restores quarantined bytes for active rows nor
+   detects active rows whose canonical file is absent.
+8. The committed artifact and `active/refcount=1` row remain, but every download
+   now returns `500 blob bytes unavailable`. The assembled finalize temp was
+   already removed, so retry cannot repair the committed artifact.
+
+A deterministic remnant reproduction—active blob row with `refcount=1`, committed
+artifact, and its only bytes at the GC quarantine path—produced:
+
+```text
+precrash_row=('active', 1)
+after restart: download_status=500 canonical_exists=false quarantine_exists=false
+```
+
+This is exactly the adversarial SIGKILL window the brief requires. The state-machine
+idea is reasonable; the implementation and recovery protocol do not preserve it.
+
+### Judgment scoring
+
+| Category | Score | Assessment |
+|---|---:|---|
+| Correctness under concurrency/crash | 0.0 / 55 | Two claimed promise-class failures zero the strict correctness ledger |
+| Data model and mechanism design | 13.5 / 20 | Good schema, transaction boundaries, sharding, streaming and intended state machine; cursor-result and recovery semantics invalidate the hardest mechanism |
+| Tenant isolation | 9.0 / 10 | Tenant predicates, uniform 404s, per-tenant artifact IDs and unconditional assembly are strong; timing equalization remains approximate |
+| Test quality | 5.5 / 8 | Broad API/concurrency/recovery coverage and a useful scale probe; two named crash tests do not reach their claimed kill windows, and neither critical defect is covered |
+| Architecture, clarity, operability | 6.0 / 7 | Clear stdlib implementation and unusually good documentation; critical guarantees are overclaimed |
+| **Provisional total** | **34 / 100** | Single-reviewer strict score; reconciliation pending |
+
+Severity sensitivity:
+
+| Corrupt read | GC crash loss | Result |
+|---|---|---:|
+| CRITICAL x2 | CRITICAL x2 | **34** |
+| HIGH x2 | CRITICAL x2 | **45** |
+| HIGH x2 | HIGH x2 | **59** |
+
+### Rejected or zero-score concerns
+
+- **REJECTED — scale envelope failure.** The provided scale probe passed all of
+  its asserted thresholds, and code inspection supports bounded memory through
+  the 10 GiB path.
+- **REJECTED — global finalize serialization.** Large assembly and hashing are
+  outside SQLite write transactions; only the short metadata claim serializes.
+- **REJECTED — replay overwrite.** Same-index mutation is guarded, the committed
+  row is checked before placement, and conflicting content leaves disk untouched.
+- **REJECTED — duplicate artifact from concurrent finalize.** The unique upload
+  constraint plus transactional refcount rollback converges both callers on one
+  artifact ID.
+- **PLAUSIBLE, zero score — residual dedup timing.** Novel content performs final
+  placement/fsync while a dedup hit does not, but a 4-pair 128 MiB probe measured
+  only a 1.03x median difference. That is not a demonstrated classifier.
+
+### Architectural verdict and repair order
+
+The revised submission chose the right broad shape for the scale envelope. Its
+failure is not “Qwen added needless enterprise complexity”; it is that the two
+most important safety boundaries still rely on assumptions the implementation
+does not enforce.
+
+1. **Repair GC before anything else.** Test `cursor.rowcount == 1` before touching
+   bytes. Recovery must reconcile quarantine files with the blob row: restore a
+   quarantine for `active/refcount>0`, delete it only for a committed tombstone,
+   and explicitly detect active rows missing canonical bytes.
+2. **Verify before committing a download response.** Open the blob, hash and
+   length-check it before sending status/headers, then rewind the same open file
+   descriptor and stream it. At minimum, `validated=0` must make download fail,
+   but that alone does not detect corruption occurring between validation passes.
+3. **Make crash tests phase-aware.** Add deterministic failpoints/barriers after
+   quarantine rename, after blob placement, and before metadata commit. Kill only
+   after the child confirms it reached the target phase; fixed sleeps are not
+   evidence of a mid-operation crash.
+4. **Use operation-specific hashing errors.** The general chunk helper should not
+   translate a missing blob into a chunk-specific 422 that bypasses the validator's
+   missing-file accounting.
+
+With those repairs, this architecture could score above the original compact
+submission because its streaming, sharding, lock granularity and scale behavior
+are substantially better. In its current form, the architectural direction is
+good but the core promises are not yet trustworthy.

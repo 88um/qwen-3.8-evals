@@ -10,7 +10,11 @@ scales with how honestly your code does what your `DECISIONS.md` says it does.
 
 Budget: roughly 60–120 minutes of work. Target 1,500–4,000 lines. Correctness
 under concurrency, crashes, and cross-tenant attack outranks feature count,
-polish, and everything else.
+polish, and everything else — but note that the **scale envelope in §2 is part
+of the interface contract, not polish**: shrinking the product until it is easy
+to make correct (tiny artifact caps, whole-artifact buffering, global
+serialization) is scored as a contract violation, not a defensible design
+choice. Build the real thing, then make the real thing correct.
 
 ---
 
@@ -70,6 +74,30 @@ before `serve` starts:
 
 Your service reads this at startup as the source of truth for who may call what.
 
+### Scale envelope (part of the contract)
+
+The reviewers build probes against these minimums exactly as they do against the
+endpoints. A submission whose stated or effective limits fall below them is
+scored under §6 as a contract violation (a confirmed correctness finding), not
+as a disclosed design choice.
+
+- **Artifacts up to 10 GiB** must be accepted, finalized, and served.
+- **Chunk PUT bodies up to 32 MiB** must be accepted. You may allow larger;
+  whatever limit you state must actually be enforced on the wire — a stated
+  limit the reviewer exceeds without rejection is itself a finding.
+- **Bounded memory:** resident memory must stay under **512 MiB** during any
+  single operation, including a 10 GiB upload, finalize, or download. In
+  practice this means streaming I/O end to end; the reviewers will measure RSS
+  during a multi-GiB round-trip.
+- **No global stalls:** a validation pass over the full store must not stop the
+  world. A finalize or download issued mid-validation must complete within
+  roughly 2× its unloaded latency. Concurrent finalizes of *different* content
+  must actually overlap, not serialize behind one global lock.
+- **Metadata scale:** with 10,000 stored artifacts/blobs, listings, lookups, and
+  GC passes must remain responsive (single-digit seconds, not minutes). Plan
+  your filesystem layout accordingly (10k+ files in one flat directory is your
+  problem to have thought about).
+
 ### HTTP endpoints
 
 | Method + path | Auth | Behavior |
@@ -86,8 +114,10 @@ Your service reads this at startup as the source of truth for who may call what.
 | `GET /admin/validate` | admin | Trigger background validation: re-hash stored bytes, flag any whose content no longer matches its address; return counts. |
 | `GET /health` | none | `200`. |
 
-Return JSON `{"error": "..."}` with appropriate status on failure. Reasonable
-limits (max chunk size, max artifact size) are yours to set and state in DECISIONS.
+Return JSON `{"error": "..."}` with appropriate status on failure. Limits (max
+chunk size, max artifact size) are yours to set and state in DECISIONS **at or
+above the scale envelope's minimums**, and every stated limit must be enforced
+on the wire.
 
 ## 3. Required behaviors the review will probe
 
@@ -119,6 +149,12 @@ These are the minimum scenarios the reviewers will construct probes for. Your
   `t1` already stored that content.
 - **Cross-tenant ID probing** — `t2` requests `t1`'s `artifact_id` and `upload_id`
   directly → `404`, indistinguishable from a truly unknown id.
+- **Scale probes (the envelope, exercised)** — a multi-GiB artifact round-trips
+  while the reviewer watches resident memory (streaming, not buffering); several
+  concurrent finalizes of distinct content overlap rather than serialize; a
+  finalize and a download issued while `/admin/validate` runs against a full
+  store complete without waiting for it; the service stays responsive at
+  10,000 stored blobs.
 
 ## 4. Constraints
 
@@ -142,8 +178,13 @@ These are the minimum scenarios the reviewers will construct probes for. Your
                    rename / fsync ordering), and how a reviewer checks it.
                    State your durability ordering and your finalize-vs-GC
                    coordination explicitly — those are the two the review
-                   hits hardest. Honest "not implemented / best-effort" notes
-                   here cost you far less than an overclaim the review breaks.
+                   hits hardest. The register must also speak to the scale
+                   envelope: name the mechanism that bounds per-request
+                   memory (streaming path) and the lock granularity that
+                   keeps validation/GC from stalling unrelated operations.
+                   Honest "not implemented / best-effort" notes here cost
+                   you far less than an overclaim the review breaks — but
+                   scale-envelope minimums cannot be waived by disclosure.
   src/ ...         the implementation
   migrations/ ...  schema (if separate)
   tests/ ...       your own tests, including at least one crash-recovery test
@@ -158,6 +199,10 @@ from **confirmed** findings only (a CONFIRMED needs a runnable repro or a
 line-referenced interleaving trace), the claims register as the attack target
 (a claimed-but-broken invariant costs double; a required invariant missing from
 the register is scored as if broken), and a capped, averaged judgment layer.
+Scale-envelope violations (§2) are confirmed correctness findings like any
+other: a limit below the envelope, a blown memory ceiling, or a global stall
+lands in the correctness row below, with severity set by how far short of the
+contract the submission falls.
 
 | Category | Weight |
 |---|---:|
