@@ -1,0 +1,38 @@
+{
+  "name": "fallback-earlier-offset",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-10-25T00:00:00Z",
+      "end": "2026-11-05T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "sun"
+        ],
+        "time": "01:30"
+      }
+    ],
+    "edits": []
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-10-25",
+        "local_time": "01:30",
+        "instant": "2026-10-25T05:30:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-11-01",
+        "local_time": "01:30",
+        "instant": "2026-11-01T05:30:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

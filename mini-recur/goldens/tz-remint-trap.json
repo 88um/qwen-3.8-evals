@@ -1,0 +1,44 @@
+{
+  "name": "tz-remint-trap",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-06-12T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "mon"
+        ],
+        "time": "10:00"
+      }
+    ],
+    "edits": [
+      {
+        "at": "2026-06-08T15:00:00Z",
+        "kind": "set_timezone",
+        "timezone": "America/Los_Angeles"
+      }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-01",
+        "local_time": "10:00",
+        "instant": "2026-06-01T14:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-08",
+        "local_time": "10:00",
+        "instant": "2026-06-08T14:00:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import sys
+import json
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from copy import deepcopy
+
+UTC = timezone.utc
+EPOCH_MIN = datetime(1970, 1, 1, tzinfo=UTC)
+EPOCH_MAX = datetime(2099, 12, 31, tzinfo=UTC)
+DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def classify_local_time(naive_dt, tz):
+    dt0 = naive_dt.replace(tzinfo=tz)
+    dt1 = naive_dt.replace(fold=1, tzinfo=tz)
+    utc0 = dt0.astimezone(UTC)
+    utc1 = dt1.astimezone(UTC)
+
+    if utc0 == utc1:
+        return False, utc0
+
+    rt = utc0.astimezone(tz).replace(tzinfo=None)
+    if rt == naive_dt:
+        return False, utc0
+    else:
+        return True, utc0
+
+
+def main():
+    scenario = json.load(sys.stdin)
+
+    initial_tz = scenario["timezone"]
+    window_start = datetime.fromisoformat(scenario["window"]["start"].replace("Z", "+00:00"))
+    window_end = datetime.fromisoformat(scenario["window"]["end"].replace("Z", "+00:00"))
+
+    rules = {}
+    for r in scenario["rules"]:
+        rules[r["id"]] = {"days": set(r["days"]), "time": r["time"]}
+
+    edits = scenario.get("edits", [])
+    edit_instants = [datetime.fromisoformat(e["at"].replace("Z", "+00:00")) for e in edits]
+
+    epochs = []
+    cur_tz = initial_tz
+    cur_rules = deepcopy(rules)
+    boundaries = [EPOCH_MIN] + edit_instants + [EPOCH_MAX]
+
+    for i in range(len(boundaries) - 1):
+        epochs.append((boundaries[i], boundaries[i + 1], cur_tz, deepcopy(cur_rules)))
+        if i < len(edits):
+            e = edits[i]
+            if e["kind"] == "set_time":
+                cur_rules[e["rule_id"]]["time"] = e["time"]
+            elif e["kind"] == "set_timezone":
+                cur_tz = e["timezone"]
+
+    candidates = []
+
+    for ep_start, ep_end, tz_name, ep_rules in epochs:
+        tz = ZoneInfo(tz_name)
+        eff_start = max(ep_start, window_start)
+        eff_end = min(ep_end, window_end)
+        if eff_start >= eff_end:
+            continue
+
+        d_start = eff_start.astimezone(tz).date() - timedelta(days=1)
+        d_end = eff_end.astimezone(tz).date() + timedelta(days=1)
+
+        d = d_start
+        while d <= d_end:
+            wday = DAY_NAMES[d.weekday()]
+            for rid, rule in ep_rules.items():
+                if wday in rule["days"]:
+                    h, m = map(int, rule["time"].split(":"))
+                    naive = datetime(d.year, d.month, d.day, h, m)
+                    is_gap, firing = classify_local_time(naive, tz)
+
+                    if eff_start <= firing < eff_end:
+                        candidates.append({
+                            "rule_id": rid,
+                            "local_date": d.isoformat(),
+                            "local_time": rule["time"],
+                            "firing": firing,
+                            "status": "skipped_dst" if is_gap else "scheduled",
+                        })
+            d += timedelta(days=1)
+
+    candidates.sort(key=lambda c: (c["firing"], c["rule_id"]))
+
+    seen = {}
+    result = []
+    for c in candidates:
+        key = (c["rule_id"], c["local_date"])
+        prev = seen.get(key)
+        if prev == "scheduled":
+            continue
+        if prev == "skipped_dst" and c["status"] == "skipped_dst":
+            continue
+        seen[key] = c["status"]
+        result.append(c)
+
+    occurrences = []
+    for c in result:
+        instant = None if c["status"] == "skipped_dst" else c["firing"].strftime("%Y-%m-%dT%H:%M:%SZ")
+        occurrences.append({
+            "rule_id": c["rule_id"],
+            "local_date": c["local_date"],
+            "local_time": c["local_time"],
+            "instant": instant,
+            "status": c["status"],
+        })
+
+    json.dump({"occurrences": occurrences}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

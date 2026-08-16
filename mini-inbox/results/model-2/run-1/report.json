@@ -1,0 +1,18 @@
+{
+  "submission": "model-2",
+  "run": 1,
+  "kills": 3,
+  "mismatched": [],
+  "aborted": null,
+  "score": 100,
+  "verdict": "PASS",
+  "settled_after_s": 0.0,
+  "provider_stats": {
+    "events_emitted": 60,
+    "deliveries_ok": 81,
+    "delivery_failures": 5,
+    "subscription_requests": 49,
+    "rate_429s": 11,
+    "done": true
+  }
+}

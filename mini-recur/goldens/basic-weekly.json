@@ -1,0 +1,74 @@
+{
+  "name": "basic-weekly",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-06-15T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "mon",
+          "thu"
+        ],
+        "time": "09:00"
+      },
+      {
+        "id": "r2",
+        "days": [
+          "sat"
+        ],
+        "time": "18:45"
+      }
+    ],
+    "edits": []
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-01",
+        "local_time": "09:00",
+        "instant": "2026-06-01T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-04",
+        "local_time": "09:00",
+        "instant": "2026-06-04T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r2",
+        "local_date": "2026-06-06",
+        "local_time": "18:45",
+        "instant": "2026-06-06T22:45:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-08",
+        "local_time": "09:00",
+        "instant": "2026-06-08T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-11",
+        "local_time": "09:00",
+        "instant": "2026-06-11T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r2",
+        "local_date": "2026-06-13",
+        "local_time": "18:45",
+        "instant": "2026-06-13T22:45:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

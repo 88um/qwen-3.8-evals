@@ -1,0 +1,59 @@
+{
+  "name": "tz-change-mid-window",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-06-15T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "mon",
+          "fri"
+        ],
+        "time": "10:00"
+      }
+    ],
+    "edits": [
+      {
+        "at": "2026-06-06T00:00:00Z",
+        "kind": "set_timezone",
+        "timezone": "Asia/Tokyo"
+      }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-01",
+        "local_time": "10:00",
+        "instant": "2026-06-01T14:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-05",
+        "local_time": "10:00",
+        "instant": "2026-06-05T14:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-08",
+        "local_time": "10:00",
+        "instant": "2026-06-08T01:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-12",
+        "local_time": "10:00",
+        "instant": "2026-06-12T01:00:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

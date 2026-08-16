@@ -1,0 +1,1 @@
+{"timezone": "America/New_York", "window": {"start": "2026-03-01T00:00:00Z", "end": "2026-03-22T00:00:00Z"}, "rules": [{"id": "r1", "days": ["wed"], "time": "12:00"}], "edits": [{"at": "2026-03-11T13:00:00Z", "kind": "set_time", "rule_id": "r1", "time": "08:00"}]}

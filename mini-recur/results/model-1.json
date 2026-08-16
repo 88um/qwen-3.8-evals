@@ -1,0 +1,16 @@
+{
+  "score": 100,
+  "passed": [
+    "basic-weekly",
+    "berlin-spring-gap",
+    "edit-future-time",
+    "edit-same-day-dedup",
+    "edit-step-over",
+    "fallback-earlier-offset",
+    "spring-gap",
+    "tz-change-mid-window",
+    "tz-remint-trap",
+    "window-boundaries"
+  ],
+  "failed": []
+}

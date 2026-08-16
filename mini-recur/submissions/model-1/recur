@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""recur — mini-recur recurrence engine (submission model-1).
+
+Reads one JSON scenario on stdin, writes one JSON result on stdout.
+Semantics: config epochs, candidate slots per epoch config, DST-aware slot
+resolution (earliest-occurrence for ambiguous wall times, gap-advanced
+ordering instant for nonexistent ones), epoch+window validity, and
+first-writer-wins dedup on (rule_id, local_date).
+"""
+import json
+import sys
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+UTC = timezone.utc
+_BEGIN = datetime(1, 1, 1, tzinfo=UTC)
+_END = datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)
+_DAY = timedelta(days=1)
+_MARGIN = timedelta(days=3)
+_DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def parse_instant(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def fmt_instant(dt):
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    h, m = (int(x) for x in s.split(":"))
+    return dtime(h, m)
+
+
+def make_rule(r):
+    return {
+        "id": r["id"],
+        "days": {_DAYS[d] for d in r["days"]},
+        "time": r["time"],
+        "t": parse_time(r["time"]),
+    }
+
+
+def resolve(tz, naive):
+    """Resolve a naive local datetime under tz.
+
+    Returns (status, ordering_instant). zoneinfo's fold=0 lookup yields the
+    earlier offset for ambiguous wall times and the pre-gap offset for
+    nonexistent ones; a round-trip inequality detects nonexistent times.
+    See NOTES.md for the mechanism and verification.
+    """
+    u = naive.replace(tzinfo=tz).astimezone(UTC)
+    if u.astimezone(tz).replace(tzinfo=None) != naive:
+        return "skipped_dst", u
+    return "scheduled", u
+
+
+def main():
+    scenario = json.load(sys.stdin)
+    tz = ZoneInfo(scenario["timezone"])
+    rules = [make_rule(r) for r in scenario["rules"]]
+    ws = parse_instant(scenario["window"]["start"])
+    we = parse_instant(scenario["window"]["end"])
+
+    epochs = [(_BEGIN, tz, rules)]
+    for edit in scenario["edits"]:
+        at = parse_instant(edit["at"])
+        if edit["kind"] == "set_timezone":
+            tz = ZoneInfo(edit["timezone"])
+        elif edit["kind"] == "set_time":
+            rules = [
+                dict(r, time=edit["time"], t=parse_time(edit["time"]))
+                if r["id"] == edit["rule_id"]
+                else r
+                for r in rules
+            ]
+        epochs.append((at, tz, rules))
+
+    candidates = []
+    for k in range(len(epochs)):
+        _, tz_k, rules_k = epochs[k]
+        upper = epochs[k + 1][0] if k + 1 < len(epochs) else _END
+        lo = max(epochs[k][0], ws)
+        hi = min(upper, we)
+        if lo >= hi:
+            continue
+        d = (lo.astimezone(tz_k) - _MARGIN).date()
+        d_end = (hi.astimezone(tz_k) + _MARGIN).date()
+        while d <= d_end:
+            wd = d.weekday()
+            for r in rules_k:
+                if wd in r["days"]:
+                    status, u = resolve(tz_k, datetime.combine(d, r["t"]))
+                    if lo <= u < hi:
+                        candidates.append(
+                            (u, r["id"], d.isoformat(), status, r["time"])
+                        )
+            d += _DAY
+
+    candidates.sort(key=lambda c: (c[0], c[1]))
+
+    out = []
+    scheduled = set()
+    skipped = set()
+    for u, rid, dstr, status, tstr in candidates:
+        key = (rid, dstr)
+        if status == "skipped_dst":
+            if key in scheduled or key in skipped:
+                continue
+            skipped.add(key)
+            out.append({
+                "rule_id": rid,
+                "local_date": dstr,
+                "local_time": tstr,
+                "instant": None,
+                "status": "skipped_dst",
+            })
+        else:
+            if key in scheduled:
+                continue
+            scheduled.add(key)
+            out.append({
+                "rule_id": rid,
+                "local_date": dstr,
+                "local_time": tstr,
+                "instant": fmt_instant(u),
+                "status": "scheduled",
+            })
+
+    json.dump({"occurrences": out}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

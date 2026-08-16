@@ -1,0 +1,23 @@
+# Local infrastructure and machine-specific configuration
+scripts/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Python build/cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated evaluation runtime state. These files can contain local paths,
+# retained database pages, and transient process data.
+**/results/**/*.log
+**/results/**/state/
+
+# Private key and certificate bundles
+*.key
+*.pem
+*.p12
+*.pfx

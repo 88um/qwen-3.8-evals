@@ -1,0 +1,18 @@
+{
+  "timezone": "America/New_York",
+  "window": {
+    "start": "2026-06-01T00:00:00Z",
+    "end": "2026-06-08T00:00:00Z"
+  },
+  "rules": [
+    {
+      "id": "r1",
+      "days": [
+        "tue",
+        "sat"
+      ],
+      "time": "08:30"
+    }
+  ],
+  "edits": []
+}

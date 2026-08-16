@@ -1,0 +1,23 @@
+{
+  "submission": "model-1",
+  "run": 1,
+  "counters": {
+    "negative_available": 0,
+    "dup_hold": 0,
+    "dup_terminal": 0,
+    "terminal_before_hold": 0,
+    "append_only": 0,
+    "durability_loss": 0,
+    "replay_appended": 0,
+    "replay_rejected": 0,
+    "false_claim": 0,
+    "balance_mismatch": 0,
+    "bad_seq": 0,
+    "dup_topup_key": 0
+  },
+  "aborted": null,
+  "score": 100,
+  "verdict": "PASS",
+  "entries_total": 51,
+  "drain_wins": 5
+}

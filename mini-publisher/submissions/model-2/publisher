@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""mini-publisher: crash-safe at-most-once message delivery daemon."""
+
+import json
+import os
+import signal
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+STATE_DIR = os.environ.get("PUBLISHER_STATE_DIR", "state")
+RECEIVER_URL = os.environ.get("RECEIVER_URL", "http://127.0.0.1:8077")
+DB_PATH = os.path.join(STATE_DIR, "publisher.db")
+HTTP_TIMEOUT = 35
+AUDIT_TIMEOUT = 10
+MIN_BACKOFF = 1.0
+MAX_ATTEMPTS_BEFORE_FAIL = 10
+
+
+def get_db():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "  id TEXT PRIMARY KEY,"
+        "  payload TEXT NOT NULL,"
+        "  state TEXT NOT NULL DEFAULT 'pending',"
+        "  attempts INTEGER NOT NULL DEFAULT 0,"
+        "  confirmed_failures INTEGER NOT NULL DEFAULT 0"
+        ")"
+    )
+    conn.commit()
+    return conn
+
+
+# --------------- CLI commands ---------------
+
+def cmd_enqueue(message_id, payload):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO messages (id, payload, state, attempts, confirmed_failures) "
+            "VALUES (?, ?, 'pending', 0, 0)",
+            (message_id, payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cmd_status():
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, state, attempts FROM messages ORDER BY rowid"
+        ).fetchall()
+        messages = [{"id": r[0], "state": r[1], "attempts": r[2]} for r in rows]
+        print(json.dumps({"messages": messages}))
+    finally:
+        conn.close()
+
+
+# --------------- delivery helpers ---------------
+
+def audit_message(message_id):
+    url = f"{RECEIVER_URL}/audit?message_id={urllib.parse.quote(message_id)}"
+    resp = urllib.request.urlopen(url, timeout=AUDIT_TIMEOUT)
+    data = json.loads(resp.read())
+    return data["accepted_count"]
+
+
+def attempt_delivery(message_id, payload):
+    url = f"{RECEIVER_URL}/deliver"
+    body = json.dumps({"message_id": message_id, "payload": payload}).encode()
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+        if resp.status == 200:
+            return "accepted"
+        return "ambiguous"
+    except urllib.error.HTTPError as e:
+        if e.code == 500:
+            return "rejected"
+        return "ambiguous"
+    except Exception:
+        return "ambiguous"
+
+
+# --------------- daemon ---------------
+
+def cmd_daemon():
+    conn = get_db()
+
+    # Crash recovery: any message left in 'delivering' was in-flight when we died.
+    conn.execute("UPDATE messages SET state = 'uncertain' WHERE state = 'delivering'")
+    conn.commit()
+
+    running = True
+
+    def on_signal(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    while running:
+        did_work = False
+
+        # Phase 1: resolve every uncertain message via the audit endpoint.
+        uncertain = conn.execute(
+            "SELECT id, confirmed_failures FROM messages WHERE state = 'uncertain'"
+        ).fetchall()
+
+        for msg_id, cf in uncertain:
+            if not running:
+                break
+            try:
+                count = audit_message(msg_id)
+                if count >= 1:
+                    conn.execute(
+                        "UPDATE messages SET state = 'delivered' WHERE id = ?",
+                        (msg_id,),
+                    )
+                else:
+                    new_cf = cf + 1
+                    if new_cf >= MAX_ATTEMPTS_BEFORE_FAIL:
+                        conn.execute(
+                            "UPDATE messages SET state = 'failed', confirmed_failures = ? "
+                            "WHERE id = ?",
+                            (new_cf, msg_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE messages SET state = 'pending', confirmed_failures = ? "
+                            "WHERE id = ?",
+                            (new_cf, msg_id),
+                        )
+                conn.commit()
+                did_work = True
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+        if not running:
+            break
+
+        # Phase 2: attempt delivery for one pending message.
+        row = conn.execute(
+            "SELECT id, payload, attempts FROM messages "
+            "WHERE state = 'pending' ORDER BY rowid LIMIT 1"
+        ).fetchone()
+
+        if row is None:
+            if not did_work:
+                time.sleep(1)
+            continue
+
+        msg_id, payload, attempts = row
+
+        # --- COMMIT POINT: mark 'delivering' BEFORE the HTTP call ---
+        conn.execute(
+            "UPDATE messages SET state = 'delivering', attempts = ? WHERE id = ?",
+            (attempts + 1, msg_id),
+        )
+        conn.commit()
+
+        outcome = attempt_delivery(msg_id, payload)
+
+        if outcome == "accepted":
+            conn.execute(
+                "UPDATE messages SET state = 'delivered' WHERE id = ?", (msg_id,)
+            )
+            conn.commit()
+        elif outcome == "rejected":
+            # 500 = guaranteed not accepted, but route through uncertain→audit
+            # so every attempt is audit-confirmed per spec requirement for 'failed'.
+            conn.execute(
+                "UPDATE messages SET state = 'uncertain' WHERE id = ?", (msg_id,)
+            )
+            conn.commit()
+        else:
+            # Timeout / connection drop = ambiguous outcome.
+            conn.execute(
+                "UPDATE messages SET state = 'uncertain' WHERE id = ?", (msg_id,)
+            )
+            conn.commit()
+
+        time.sleep(MIN_BACKOFF)
+
+    conn.close()
+
+
+# --------------- entry point ---------------
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: publisher {daemon|enqueue|status}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "daemon":
+        cmd_daemon()
+    elif cmd == "enqueue":
+        if len(sys.argv) < 4:
+            print("Usage: publisher enqueue <message_id> <payload>", file=sys.stderr)
+            sys.exit(1)
+        cmd_enqueue(sys.argv[2], sys.argv[3])
+    elif cmd == "status":
+        cmd_status()
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

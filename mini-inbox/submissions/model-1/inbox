@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""mini-inbox consumer — submission model-1.
+
+Architecture: webhook events are pings, not state. An event tells us that an
+account changed; its payload is point-in-time and may be stale by arrival.
+Only the provider's canonical endpoint tells us what is true now. So:
+
+  POST /webhook  -> durably record the event (deduped by event_id) and mark
+                    the account "dirty" if the event_id is new. Ack 200
+                    immediately. No canonical fetch on the ack path.
+  reconciler     -> background thread that drains the dirty set by fetching
+                    canonical state, paced to stay inside the provider's rate
+                    budget (global minimum spacing between calls + per-account
+                    debounce) and with graceful backoff on 429.
+  GET /state/all -> accounts whose state we have actually fetched.
+
+State lives in SQLite (WAL) under $INBOX_STATE_DIR. Everything needed to
+survive a SIGKILL is committed before the webhook is acked; on restart the
+dirty set is reloaded from the database and reconciliation resumes.
+"""
+import json
+import os
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+PORT = int(os.environ.get("PORT", "8091"))
+STATE_DIR = os.environ.get("INBOX_STATE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state-dev"))
+PROVIDER_URL = os.environ.get("PROVIDER_URL", "http://127.0.0.1:8090").rstrip("/")
+
+# Budget discipline. The canonical endpoint allows 20 calls / sliding 60 s.
+# Sustained spacing of MIN_SPACING caps us at ~18.75 calls/min, strictly under
+# budget for any window, so steady-state operation never trips a 429.
+MIN_SPACING = 3.2      # seconds between any two canonical calls (global)
+DEBOUNCE = 2.0         # seconds an account stays ineligible after a fetch
+LOOP_TICK = 0.4        # reconciler loop granularity
+FETCH_TIMEOUT = 5      # seconds per canonical fetch
+
+_db = None
+_db_lock = threading.Lock()
+_last_call_ts = 0.0    # time of last actual canonical call (persisted across restarts)
+_backoff_until = 0.0   # transient: no canonical calls before this instant
+_call_count = 0
+_webhook_count = 0
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def _meta_set(key, value):
+    with _db_lock:
+        db().execute(
+            "INSERT INTO meta(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        db().commit()
+
+
+def _meta_get(key, default=0.0):
+    with _db_lock:
+        row = db().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def db():
+    global _db
+    if _db is None:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        conn = sqlite3.connect(os.path.join(STATE_DIR, "inbox.db"), check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("""CREATE TABLE IF NOT EXISTS events(
+            event_id TEXT PRIMARY KEY,
+            account_id TEXT,
+            created_at REAL,
+            received_at REAL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS accounts(
+            account_id TEXT PRIMARY KEY,
+            plan TEXT,
+            status TEXT,
+            dirty INTEGER NOT NULL DEFAULT 1,
+            last_fetch_ts REAL NOT NULL DEFAULT 0)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS meta(
+            key TEXT PRIMARY KEY,
+            value REAL)""")
+        conn.commit()
+        _db = conn
+    return _db
+
+
+def record_webhook(payload):
+    """Durable record of one webhook event. Returns True if newly recorded."""
+    global _webhook_count
+    event_id = payload.get("event_id")
+    account_id = payload.get("account_id")
+    created_at = payload.get("created_at")
+    if not isinstance(event_id, str) or not isinstance(account_id, str):
+        return False
+    now = time.time()
+    with _db_lock:
+        conn = db()
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO events(event_id, account_id, created_at, received_at) "
+            "VALUES(?,?,?,?)", (event_id, account_id, created_at, now))
+        conn.execute(
+            "INSERT INTO accounts(account_id, dirty) VALUES(?,1) "
+            "ON CONFLICT(account_id) DO UPDATE SET dirty=1", (account_id,))
+        conn.commit()
+        new = cur.rowcount > 0
+    _webhook_count += 1
+    log(f"webhook #{_webhook_count} event_id={event_id} account={account_id} new={new}")
+    return new
+
+
+def fetch_canonical(account_id):
+    """One canonical fetch. Returns (status_code, parsed_json_or_None)."""
+    url = f"{PROVIDER_URL}/subscription?account_id={urllib.request.quote(account_id)}"
+    try:
+        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = None
+        return e.code, body
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None, None
+
+
+def reconciler():
+    """Drain the dirty set inside the rate budget, forever."""
+    global _last_call_ts, _backoff_until, _call_count
+    _last_call_ts = _meta_get("last_call_ts", 0.0)
+    while True:
+        try:
+            now = time.time()
+            row = None
+            with _db_lock:
+                conn = db()
+                row = conn.execute(
+                    "SELECT account_id, last_fetch_ts FROM accounts "
+                    "WHERE dirty=1 AND last_fetch_ts <= ? "
+                    "ORDER BY last_fetch_ts ASC LIMIT 1", (now - DEBOUNCE,)).fetchone()
+            if row is None or now < _backoff_until or now - _last_call_ts < MIN_SPACING:
+                time.sleep(LOOP_TICK)
+                continue
+            account_id = row[0]
+            _last_call_ts = now
+            _meta_set("last_call_ts", now)
+            _call_count += 1
+            code, body = fetch_canonical(account_id)
+            if code == 200 and isinstance(body, dict) and body.get("plan") is not None:
+                with _db_lock:
+                    conn = db()
+                    conn.execute(
+                        "UPDATE accounts SET plan=?, status=?, dirty=0, last_fetch_ts=? "
+                        "WHERE account_id=?",
+                        (body.get("plan"), body.get("status"), time.time(), account_id))
+                    conn.commit()
+                log(f"reconciled #{_call_count} account={account_id} "
+                    f"plan={body.get('plan')} status={body.get('status')}")
+            elif code == 429:
+                retry_after = float((body or {}).get("retry_after", 5) or 5)
+                _backoff_until = time.time() + max(retry_after, MIN_SPACING)
+                log(f"429 on account={account_id}; backing off {max(retry_after, MIN_SPACING):.1f}s")
+            elif code is None:
+                _backoff_until = time.time() + MIN_SPACING
+                log(f"provider unreachable fetching account={account_id}; retrying later")
+            else:
+                # 404/other: leave dirty, debounce applies via last_fetch_ts.
+                _backoff_until = time.time() + MIN_SPACING
+                with _db_lock:
+                    conn = db()
+                    conn.execute("UPDATE accounts SET last_fetch_ts=? WHERE account_id=?",
+                                 (time.time(), account_id))
+                    conn.commit()
+                log(f"canonical fetch for account={account_id} -> {code}; retrying later")
+        except Exception as e:
+            log(f"reconciler error: {e!r}; continuing")
+            time.sleep(1.0)
+        time.sleep(LOOP_TICK)
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _j(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if u.path != "/webhook":
+            self._j(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode()) if length else {}
+        except Exception:
+            self._j(400, {"error": "bad payload"})
+            return
+        try:
+            record_webhook(payload)
+        except Exception as e:
+            log(f"webhook record failed: {e!r}")
+            self._j(500, {"error": "record failed"})
+            return
+        self._j(200, {"ok": True})
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/health":
+            self._j(200, {"ok": True})
+        elif u.path == "/state/all":
+            with _db_lock:
+                rows = db().execute(
+                    "SELECT account_id, plan, status FROM accounts "
+                    "WHERE plan IS NOT NULL").fetchall()
+            accounts = {r[0]: {"plan": r[1], "status": r[2]} for r in rows}
+            self._j(200, {"accounts": accounts})
+        else:
+            self._j(404, {"error": "not found"})
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    db()  # initialize schema before serving anything
+    threading.Thread(target=reconciler, daemon=True).start()
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = True
+    log(f"inbox consumer on http://127.0.0.1:{PORT} provider={PROVIDER_URL} state={STATE_DIR}")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,53 @@
+{
+  "name": "berlin-spring-gap",
+  "input": {
+    "timezone": "Europe/Berlin",
+    "window": {
+      "start": "2026-03-25T00:00:00Z",
+      "end": "2026-04-02T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "sun",
+          "mon"
+        ],
+        "time": "02:30"
+      },
+      {
+        "id": "r2",
+        "days": [
+          "sun"
+        ],
+        "time": "12:00"
+      }
+    ],
+    "edits": []
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-03-29",
+        "local_time": "02:30",
+        "instant": null,
+        "status": "skipped_dst"
+      },
+      {
+        "rule_id": "r2",
+        "local_date": "2026-03-29",
+        "local_time": "12:00",
+        "instant": "2026-03-29T10:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-03-30",
+        "local_time": "02:30",
+        "instant": "2026-03-30T00:30:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

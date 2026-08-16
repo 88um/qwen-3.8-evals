@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""mini-publisher: crash-safe, at-most-once message delivery daemon.
+
+Commands:
+  publisher daemon                    run the delivery daemon in the foreground
+  publisher enqueue <id> <payload>    enqueue a message (no-op if id already exists)
+  publisher status --json             print {"messages": [{"id","state","attempts"}, ...]}
+
+Env:
+  PUBLISHER_STATE_DIR  where all persistent state lives (default: <script_dir>/state)
+  RECEIVER_URL         base URL of the receiver, e.g. http://127.0.0.1:8077
+"""
+import fcntl
+import json
+import os
+import socket
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_DIR = os.environ.get("PUBLISHER_STATE_DIR") or os.path.join(SCRIPT_DIR, "state")
+DB_PATH = os.path.join(STATE_DIR, "publisher.db")
+LOCK_PATH = os.path.join(STATE_DIR, "daemon.lock")
+RECEIVER_URL = os.environ.get("RECEIVER_URL", "").rstrip("/")
+
+DELIVER_TIMEOUT_S = 10.0
+AUDIT_TIMEOUT_S = 5.0
+BACKOFF_S = 1.0
+FAIL_THRESHOLD = 10
+LOCK_GRACE_S = 10.0
+IDLE_SLEEP_S = 0.5
+BUSY_SLEEP_S = 0.05
+
+
+def open_db():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=10000")
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS messages ("
+        " id TEXT PRIMARY KEY,"
+        " payload TEXT NOT NULL,"
+        " state TEXT NOT NULL,"
+        " attempts INTEGER NOT NULL DEFAULT 0,"
+        " last_attempt_at REAL)"
+    )
+    db.commit()
+    return db
+
+
+def cmd_enqueue(message_id, payload):
+    if not message_id:
+        print("message_id must be non-empty", file=sys.stderr)
+        return 2
+    db = open_db()
+    try:
+        db.execute(
+            "INSERT OR IGNORE INTO messages (id, payload, state, attempts)"
+            " VALUES (?, ?, 'pending', 0)",
+            (message_id, payload),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_status():
+    db = open_db()
+    try:
+        rows = db.execute(
+            "SELECT id, state, attempts FROM messages ORDER BY rowid"
+        ).fetchall()
+    finally:
+        db.close()
+    print(json.dumps({"messages": [{"id": i, "state": s, "attempts": a} for i, s, a in rows]}))
+    return 0
+
+
+def post_deliver(message_id, payload):
+    body = json.dumps({"message_id": message_id, "payload": payload}).encode()
+    req = urllib.request.Request(
+        RECEIVER_URL + "/deliver",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=DELIVER_TIMEOUT_S) as resp:
+            code = resp.getcode()
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except (socket.timeout, urllib.error.URLError, OSError):
+        return "ambiguous"
+    if code == 200:
+        return "accepted"
+    if code == 500:
+        return "rejected"
+    return "ambiguous"
+
+
+def audit_count(message_id):
+    url = RECEIVER_URL + "/audit?message_id=" + urllib.parse.quote(message_id, safe="")
+    try:
+        with urllib.request.urlopen(url, timeout=AUDIT_TIMEOUT_S) as resp:
+            data = json.loads(resp.read())
+        return int(data["accepted_count"])
+    except Exception:
+        return None
+
+
+def acquire_lock():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    fd = open(LOCK_PATH, "a")
+    deadline = time.time() + LOCK_GRACE_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                fd.close()
+                return None
+            time.sleep(0.2)
+
+
+def daemon_step(db):
+    now = time.time()
+    row = db.execute(
+        "SELECT id FROM messages WHERE state = 'uncertain' ORDER BY rowid LIMIT 1"
+    ).fetchone()
+    if row:
+        mid = row[0]
+        count = audit_count(mid)
+        if count is None:
+            return False
+        if count >= 1:
+            db.execute(
+                "UPDATE messages SET state = 'delivered'"
+                " WHERE id = ? AND state = 'uncertain'",
+                (mid,),
+            )
+        elif db.execute(
+            "SELECT attempts FROM messages WHERE id = ?", (mid,)
+        ).fetchone()[0] >= FAIL_THRESHOLD:
+            db.execute(
+                "UPDATE messages SET state = 'failed'"
+                " WHERE id = ? AND state = 'uncertain'",
+                (mid,),
+            )
+        else:
+            db.execute(
+                "UPDATE messages SET state = 'pending'"
+                " WHERE id = ? AND state = 'uncertain'",
+                (mid,),
+            )
+        db.commit()
+        return True
+
+    row = db.execute(
+        "SELECT id, payload FROM messages"
+        " WHERE state = 'pending'"
+        " AND (last_attempt_at IS NULL OR last_attempt_at <= ?)"
+        " ORDER BY rowid LIMIT 1",
+        (now - BACKOFF_S,),
+    ).fetchone()
+    if row:
+        mid, payload = row
+        cur = db.execute(
+            "UPDATE messages SET state = 'delivering', last_attempt_at = ?"
+            " WHERE id = ? AND state = 'pending'",
+            (now, mid),
+        )
+        db.commit()
+        if cur.rowcount == 0:
+            return False
+        outcome = post_deliver(mid, payload)
+        if outcome == "accepted":
+            db.execute(
+                "UPDATE messages SET state = 'delivered'"
+                " WHERE id = ? AND state = 'delivering'",
+                (mid,),
+            )
+        else:
+            db.execute(
+                "UPDATE messages SET state = 'uncertain', attempts = attempts + 1"
+                " WHERE id = ? AND state = 'delivering'",
+                (mid,),
+            )
+        db.commit()
+        return True
+    return False
+
+
+def cmd_daemon():
+    if not RECEIVER_URL:
+        print("RECEIVER_URL is not set", file=sys.stderr)
+        return 1
+    lock_fd = acquire_lock()
+    if lock_fd is None:
+        print("another daemon holds the lock; exiting", file=sys.stderr)
+        return 1
+    db = open_db()
+    db.execute("UPDATE messages SET state = 'uncertain' WHERE state = 'delivering'")
+    db.commit()
+    try:
+        while True:
+            worked = daemon_step(db)
+            time.sleep(BUSY_SLEEP_S if worked else IDLE_SLEEP_S)
+    finally:
+        db.close()
+        lock_fd.close()
+    return 0
+
+
+def main(argv):
+    if not argv:
+        print(
+            "usage: publisher daemon | publisher enqueue <id> <payload>"
+            " | publisher status --json",
+            file=sys.stderr,
+        )
+        return 2
+    cmd = argv[0]
+    if cmd == "daemon" and len(argv) == 1:
+        return cmd_daemon()
+    if cmd == "enqueue" and len(argv) == 3:
+        return cmd_enqueue(argv[1], argv[2])
+    if cmd == "status" and len(argv) == 2 and argv[1] == "--json":
+        return cmd_status()
+    print(
+        "usage: publisher daemon | publisher enqueue <id> <payload>"
+        " | publisher status --json",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,38 @@
+{
+  "name": "window-boundaries",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-06-05T00:00:00Z",
+      "end": "2026-06-19T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "thu"
+        ],
+        "time": "20:00"
+      }
+    ],
+    "edits": []
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-04",
+        "local_time": "20:00",
+        "instant": "2026-06-05T00:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-11",
+        "local_time": "20:00",
+        "instant": "2026-06-12T00:00:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

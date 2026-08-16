@@ -1,0 +1,52 @@
+{
+  "name": "edit-same-day-dedup",
+  "input": {
+    "timezone": "America/New_York",
+    "window": {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-06-22T00:00:00Z"
+    },
+    "rules": [
+      {
+        "id": "r1",
+        "days": [
+          "wed"
+        ],
+        "time": "09:00"
+      }
+    ],
+    "edits": [
+      {
+        "at": "2026-06-10T19:00:00Z",
+        "kind": "set_time",
+        "rule_id": "r1",
+        "time": "19:30"
+      }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-03",
+        "local_time": "09:00",
+        "instant": "2026-06-03T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-10",
+        "local_time": "09:00",
+        "instant": "2026-06-10T13:00:00Z",
+        "status": "scheduled"
+      },
+      {
+        "rule_id": "r1",
+        "local_date": "2026-06-17",
+        "local_time": "19:30",
+        "instant": "2026-06-17T23:30:00Z",
+        "status": "scheduled"
+      }
+    ]
+  }
+}

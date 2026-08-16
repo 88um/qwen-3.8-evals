@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""Credit ledger service with serialized SQLite transactions."""
+
+import json
+import os
+import sqlite3
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+PORT = int(os.environ.get("PORT", "9100"))
+STATE_DIR = os.environ.get("LEDGER_STATE_DIR", "./state")
+
+_local = threading.local()
+
+
+def get_db():
+    if not hasattr(_local, "db"):
+        db = sqlite3.connect(
+            os.path.join(STATE_DIR, "ledger.db"),
+            timeout=30,
+            isolation_level=None,
+        )
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA busy_timeout=30000")
+        db.row_factory = sqlite3.Row
+        _local.db = db
+    return _local.db
+
+
+def init_db():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    db = sqlite3.connect(
+        os.path.join(STATE_DIR, "ledger.db"), isolation_level=None
+    )
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=FULL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS ledger (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            ref TEXT,
+            amount INTEGER NOT NULL,
+            key TEXT
+        );
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_id TEXT PRIMARY KEY,
+            balance INTEGER NOT NULL,
+            available INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS holds (
+            ref TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open'
+        );
+        CREATE TABLE IF NOT EXISTS topup_keys (
+            key TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            amount INTEGER NOT NULL
+        );
+    """)
+    db.close()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n)) if n else {}
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        if p.path == "/account":
+            aid = (parse_qs(p.query).get("account_id") or [None])[0]
+            if not aid:
+                return self._json(400, {"error": "missing account_id"})
+            db = get_db()
+            row = db.execute(
+                "SELECT balance, available FROM accounts WHERE account_id=?",
+                (aid,),
+            ).fetchone()
+            if not row:
+                return self._json(404, {"error": "not found"})
+            self._json(200, {"balance": row["balance"], "available": row["available"]})
+        elif p.path == "/ledger":
+            db = get_db()
+            rows = db.execute(
+                "SELECT seq, kind, account_id, ref, amount, key "
+                "FROM ledger ORDER BY seq"
+            ).fetchall()
+            self._json(200, {"entries": [dict(r) for r in rows]})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        try:
+            body = self._body()
+        except (json.JSONDecodeError, ValueError):
+            return self._json(400, {"error": "bad json"})
+        dispatch = {
+            "/account": self._create_account,
+            "/topup": self._topup,
+            "/hold": self._hold,
+            "/charge": self._charge,
+            "/release": self._release,
+        }
+        fn = dispatch.get(p.path)
+        if not fn:
+            return self._json(404, {"error": "not found"})
+        try:
+            fn(body)
+        except Exception:
+            self._json(500, {"error": "internal"})
+
+    def _tx(self, fn):
+        db = get_db()
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            result = fn(db)
+            db.execute("COMMIT")
+            return result
+        except Exception:
+            try:
+                db.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def _create_account(self, body):
+        aid = body["account_id"]
+        initial = body.get("initial", 0)
+
+        def work(db):
+            if db.execute(
+                "SELECT 1 FROM accounts WHERE account_id=?", (aid,)
+            ).fetchone():
+                return 200, {"account_id": aid}
+            db.execute(
+                "INSERT INTO accounts VALUES(?,?,?)", (aid, initial, initial)
+            )
+            db.execute(
+                "INSERT INTO ledger(kind,account_id,ref,amount,key) "
+                "VALUES('account_open',?,NULL,?,NULL)",
+                (aid, initial),
+            )
+            return 200, {"account_id": aid}
+
+        code, resp = self._tx(work)
+        self._json(code, resp)
+
+    def _topup(self, body):
+        aid, amount, key = body["account_id"], body["amount"], body["key"]
+
+        def work(db):
+            if not db.execute(
+                "SELECT 1 FROM accounts WHERE account_id=?", (aid,)
+            ).fetchone():
+                return 404, {"error": "not found"}
+            if db.execute(
+                "SELECT 1 FROM topup_keys WHERE key=?", (key,)
+            ).fetchone():
+                return 200, {"key": key}
+            db.execute(
+                "INSERT INTO topup_keys VALUES(?,?,?)", (key, aid, amount)
+            )
+            db.execute(
+                "UPDATE accounts SET balance=balance+?, available=available+? "
+                "WHERE account_id=?",
+                (amount, amount, aid),
+            )
+            db.execute(
+                "INSERT INTO ledger(kind,account_id,ref,amount,key) "
+                "VALUES('topup',?,NULL,?,?)",
+                (aid, amount, key),
+            )
+            return 200, {"key": key}
+
+        code, resp = self._tx(work)
+        self._json(code, resp)
+
+    def _hold(self, body):
+        aid, ref, amount = body["account_id"], body["ref"], body["amount"]
+
+        def work(db):
+            existing = db.execute(
+                "SELECT account_id, amount FROM holds WHERE ref=?", (ref,)
+            ).fetchone()
+            if existing:
+                if existing["account_id"] == aid and existing["amount"] == amount:
+                    return 200, {"held": True}
+                return 409, {"error": "duplicate_ref"}
+            acct = db.execute(
+                "SELECT available FROM accounts WHERE account_id=?", (aid,)
+            ).fetchone()
+            if not acct:
+                return 404, {"error": "not found"}
+            if acct["available"] < amount:
+                return 409, {"error": "insufficient"}
+            db.execute(
+                "INSERT INTO holds VALUES(?,?,?,'open')", (ref, aid, amount)
+            )
+            db.execute(
+                "UPDATE accounts SET available=available-? WHERE account_id=?",
+                (amount, aid),
+            )
+            db.execute(
+                "INSERT INTO ledger(kind,account_id,ref,amount,key) "
+                "VALUES('hold',?,?,?,NULL)",
+                (aid, ref, amount),
+            )
+            return 200, {"held": True}
+
+        code, resp = self._tx(work)
+        self._json(code, resp)
+
+    def _charge(self, body):
+        ref = body["ref"]
+
+        def work(db):
+            hold = db.execute(
+                "SELECT account_id, amount, status FROM holds WHERE ref=?",
+                (ref,),
+            ).fetchone()
+            if not hold:
+                return 404, {"error": "unknown ref"}
+            if hold["status"] == "charged":
+                return 200, {"charged": True}
+            if hold["status"] == "released":
+                return 409, {"error": "already released"}
+            db.execute(
+                "UPDATE holds SET status='charged' WHERE ref=?", (ref,)
+            )
+            db.execute(
+                "UPDATE accounts SET balance=balance-? WHERE account_id=?",
+                (hold["amount"], hold["account_id"]),
+            )
+            db.execute(
+                "INSERT INTO ledger(kind,account_id,ref,amount,key) "
+                "VALUES('charge',?,?,?,NULL)",
+                (hold["account_id"], ref, hold["amount"]),
+            )
+            return 200, {"charged": True}
+
+        code, resp = self._tx(work)
+        self._json(code, resp)
+
+    def _release(self, body):
+        ref = body["ref"]
+
+        def work(db):
+            hold = db.execute(
+                "SELECT account_id, amount, status FROM holds WHERE ref=?",
+                (ref,),
+            ).fetchone()
+            if not hold:
+                return 404, {"error": "unknown ref"}
+            if hold["status"] == "released":
+                return 200, {"released": True}
+            if hold["status"] == "charged":
+                return 409, {"error": "already charged"}
+            db.execute(
+                "UPDATE holds SET status='released' WHERE ref=?", (ref,)
+            )
+            db.execute(
+                "UPDATE accounts SET available=available+? WHERE account_id=?",
+                (hold["amount"], hold["account_id"]),
+            )
+            db.execute(
+                "INSERT INTO ledger(kind,account_id,ref,amount,key) "
+                "VALUES('release',?,?,?,NULL)",
+                (hold["account_id"], ref, hold["amount"]),
+            )
+            return 200, {"released": True}
+
+        code, resp = self._tx(work)
+        self._json(code, resp)
+
+
+def main():
+    init_db()
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    print(f"ledger serving on :{PORT}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        main()
+    else:
+        print("Usage: ./ledger serve", file=sys.stderr)
+        sys.exit(1)
