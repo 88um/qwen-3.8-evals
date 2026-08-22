@@ -268,3 +268,47 @@ The best combined plan would start from Qwen and incorporate selected Opus ideas
 Choose **Qwen** as the winner and revision base. Borrow Opus's explicit queue-time auto-submit flag and full form-snapshot entity, but not its crash recovery or OTP design. Do not carry forward Sonnet's LLM-audits-LLM truth model, credit implementation, or stale-submit reset.
 
 The key product-management conclusion is that the plans differ less in feature coverage than in whether they respect uncertainty. Qwen comes closest: it is willing to fail closed in several places and makes most behavior inspectable. Its remaining mistake is allowing convenience to reopen an application after the one moment where certainty has been lost. Fix that, make authorization durable, and the plan becomes a credible route to a trustworthy v1.
+
+## Appendix: ox-alpha rating
+
+**Rating: 73/100. Verdict: strong revision, not safe to implement as written.**
+
+| Category | Score |
+|---|---:|
+| Core promises and hard invariants | 24/35 |
+| Feature completeness | 11/15 |
+| Architecture and data model | 10/15 |
+| AI, ranking, and cost strategy | 8/12 |
+| Failure handling and testing | 9/10 |
+| Security, privacy, and operations | 6/8 |
+| Delivery quality and authoring-standard compliance | 5/5 |
+| **Total** | **73/100** |
+
+This is a better conceptual design than the first Qwen plan. It adds a real `unverified` state, refuses automatic replay after the pre-click barrier, retains the credit hold during uncertainty, reserves OTP capacity, models atomic profile facts, names the posting-enrichment producer, commits to exact model families, and gives most phases binary exit criteria. The failure walkthrough and FakeATS test program are particularly good.
+
+The score stays below the original Qwen rating because ox-alpha introduces or retains defects in mechanisms it presents as complete:
+
+- **The DDL is not executable in order.** `applications.credit_hold_id` references `credit_holds` before that table exists, while `credit_holds.application_id` points back to `applications`. `GRANT pilot_app TO pilot_web_login` also refers to a role the DDL never creates.
+- **RLS is asserted, not supplied.** Thirteen tables enable RLS, but the plan creates a policy only for `applications`. The claimed "same shape" policy cannot work for `profile_facts`, which has no `user_id`. As written, the web role cannot use the other RLS-enabled tables.
+- **The no-double-submit promise is still open.** In `unverified`, a user can say "not submitted" and create a fresh attempt without authoritative ATS proof. A false-negative check can therefore produce a second employer POST. The chaos test stops at `unverified`; it never tests mistaken reconciliation followed by retry. Its claim that every kill point yields exactly one FakeATS receipt is also impossible for a kill that occurs before the click, where zero is the correct result.
+- **Authorization is not immutable evidence.** `mode='full_auto'`, mutable `answers`, mutable `fp_review`, and an unconstrained event do not record a consumed grant bound to the application, actor, reviewed answers, form fingerprint, profile basis, and posting basis. A server-side mutation after authorization can change what gets submitted without a new grant.
+- **Credit accounting is incomplete.** The charge/release mechanism changes `credit_holds.status` and writes the ledger, but it never names the conditional updates that decrement `users.credits_held` and, on charge, `users.credits_total`. The promised reconciliation therefore does not follow from the shown transaction. Subscription renewal credits also have no invoice-level idempotency record or processing path.
+- **Historical provenance remains mutable.** `profile_versions` is insert-only, but its `profile_facts` can be updated or deleted. Applications and documents point to a mutable `postings` row instead of a posting snapshot. `docx_key` and `pdf_key` have no checksums, renderer version, encryption metadata, or approval record.
+- **EEO collection and account deletion do not work from the shown schema.** `eeo_service` receives `SELECT` only, and no write function or role can collect or edit EEO answers. User deletion has no `ON DELETE CASCADE` relationships or ordered purge function. The trigger escape checks `session_user = 'pilot_purge'`, but `pilot_purge` is `NOLOGIN`, so a login that uses `SET ROLE pilot_purge` still cannot satisfy that condition.
+- **The late-OTP path is vendor-assumption-dependent.** Cookies plus a refill can reconstruct form inputs, but they do not prove that the employer's pending OTP challenge survives navigation or accepts the old code after the form is posted again. FakeATS can prove the fake behavior, not generic Greenhouse behavior.
+- **The AI arithmetic contradicts the routing table.** The median document row prices both NLI audits at mini rates even though §6.1 assigns them to `gpt-4.1`. Using the stated 8K mini input, 2.2K mini output, and two `gpt-4.1` audits makes the document path about $0.0144 before regeneration, not $0.0067. The overall per-application cap still looks achievable, but the monthly total and headroom are understated. The aliases `gpt-4.1-mini` and `gpt-4.1` also do not make historical runs reproducible; the dated snapshots do. Official OpenAI documentation lists both aliases and dated snapshot IDs: [GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini) and [GPT-4.1](https://developers.openai.com/api/docs/models/gpt-4.1).
+- **Automatic board discovery is explicitly missing.** User requests plus operator approval are manual acquisition, not the seeded-plus-automatic discovery required by the brief.
+
+### Revision gate
+
+Advance ox-alpha only after one revision closes these points:
+
+1. Make the migration runnable and complete every role, grant, RLS policy, ownership constraint, and deletion path.
+2. Add immutable authorization and posting-snapshot records, freeze authorized answers, and make generated artifacts checksummed and approval-aware.
+3. Keep `unverified` permanently non-retryable unless an authoritative ATS signal proves non-submission. Add the false-negative reconciliation case to FakeATS.
+4. Specify the complete balance-counter transaction and recurring subscription invoice idempotency.
+5. Make `profile_facts` immutable, validate them against the published profile, correct the model arithmetic, and pin dated model snapshots.
+6. Either prove the late-OTP protocol against the launch ATS or fail closed when the live challenge expires.
+7. Add an automatic board-discovery process with a crawl budget, normalization, validation, deduplication, and tests.
+
+With those changes, this could move into the low-to-mid 80s. Until then, the excellent detail makes the gaps easy to see, but it does not close them.
